@@ -32,6 +32,8 @@
 #include <gcrypt.h>
 #endif
 
+#include "crypto/random.h"
+
 /* #define DEBUG_GNUTLS */
 
 /*
@@ -119,6 +121,10 @@ static struct gcry_thread_cbs qcrypto_gcrypt_thread_impl = {
 
 int qcrypto_init(Error **errp)
 {
+#ifdef QCRYPTO_INIT_GCRYPT_THREADS
+    gcry_control(GCRYCTL_SET_THREAD_CBS, &qcrypto_gcrypt_thread_impl);
+#endif /* QCRYPTO_INIT_GCRYPT_THREADS */
+
 #ifdef CONFIG_GNUTLS
     int ret;
     ret = gnutls_global_init();
@@ -139,11 +145,12 @@ int qcrypto_init(Error **errp)
         error_setg(errp, "Unable to initialize gcrypt");
         return -1;
     }
-#ifdef QCRYPTO_INIT_GCRYPT_THREADS
-    gcry_control(GCRYCTL_SET_THREAD_CBS, &qcrypto_gcrypt_thread_impl);
-#endif /* QCRYPTO_INIT_GCRYPT_THREADS */
     gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
 #endif
+
+    if (qcrypto_random_init(errp) < 0) {
+        return -1;
+    }
 
     return 0;
 }

@@ -37,7 +37,6 @@
 #include "hw/mips/mips.h"
 #include "hw/mips/cpudevs.h"
 #include "hw/pci/pci.h"
-#include "sysemu/char.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/arch_init.h"
 #include "qemu/log.h"
@@ -47,7 +46,6 @@
 #include "elf.h"
 #include "hw/timer/mc146818rtc.h"
 #include "hw/timer/i8254.h"
-#include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
 #include "exec/address-spaces.h"
 #include "hw/sysbus.h"             /* SysBusDevice */
@@ -85,9 +83,10 @@ typedef struct {
     uint32_t i2coe;
     uint32_t i2cout;
     uint32_t i2csel;
-    CharDriverState *display;
+    CharBackend display;
     char display_text[9];
     SerialState *uart;
+    bool display_inited;
 } MaltaFPGAState;
 
 #define TYPE_MIPS_MALTA "mips-malta"
@@ -124,8 +123,10 @@ static void malta_fpga_update_display(void *opaque)
     }
     leds_text[8] = '\0';
 
-    qemu_chr_fe_printf(s->display, "\e[H\n\n|\e[32m%-8.8s\e[00m|\r\n", leds_text);
-    qemu_chr_fe_printf(s->display, "\n\n\n\n|\e[31m%-8.8s\e[00m|", s->display_text);
+    qemu_chr_fe_printf(&s->display, "\e[H\n\n|\e[32m%-8.8s\e[00m|\r\n",
+                       leds_text);
+    qemu_chr_fe_printf(&s->display, "\n\n\n\n|\e[31m%-8.8s\e[00m|",
+                       s->display_text);
 }
 
 /*
@@ -468,7 +469,7 @@ static void malta_fpga_write(void *opaque, hwaddr addr,
     /* SOFTRES Register */
     case 0x00500:
         if (val == 0x42)
-            qemu_system_reset_request ();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
 
     /* BRKRES Register */
@@ -530,23 +531,29 @@ static void malta_fpga_reset(void *opaque)
     snprintf(s->display_text, 9, "        ");
 }
 
-static void malta_fpga_led_init(CharDriverState *chr)
+static void malta_fgpa_display_event(void *opaque, int event)
 {
-    qemu_chr_fe_printf(chr, "\e[HMalta LEDBAR\r\n");
-    qemu_chr_fe_printf(chr, "+--------+\r\n");
-    qemu_chr_fe_printf(chr, "+        +\r\n");
-    qemu_chr_fe_printf(chr, "+--------+\r\n");
-    qemu_chr_fe_printf(chr, "\n");
-    qemu_chr_fe_printf(chr, "Malta ASCII\r\n");
-    qemu_chr_fe_printf(chr, "+--------+\r\n");
-    qemu_chr_fe_printf(chr, "+        +\r\n");
-    qemu_chr_fe_printf(chr, "+--------+\r\n");
+    MaltaFPGAState *s = opaque;
+
+    if (event == CHR_EVENT_OPENED && !s->display_inited) {
+        qemu_chr_fe_printf(&s->display, "\e[HMalta LEDBAR\r\n");
+        qemu_chr_fe_printf(&s->display, "+--------+\r\n");
+        qemu_chr_fe_printf(&s->display, "+        +\r\n");
+        qemu_chr_fe_printf(&s->display, "+--------+\r\n");
+        qemu_chr_fe_printf(&s->display, "\n");
+        qemu_chr_fe_printf(&s->display, "Malta ASCII\r\n");
+        qemu_chr_fe_printf(&s->display, "+--------+\r\n");
+        qemu_chr_fe_printf(&s->display, "+        +\r\n");
+        qemu_chr_fe_printf(&s->display, "+--------+\r\n");
+        s->display_inited = true;
+    }
 }
 
 static MaltaFPGAState *malta_fpga_init(MemoryRegion *address_space,
-         hwaddr base, qemu_irq uart_irq, CharDriverState *uart_chr)
+         hwaddr base, qemu_irq uart_irq, Chardev *uart_chr)
 {
     MaltaFPGAState *s;
+    Chardev *chr;
 
     s = (MaltaFPGAState *)g_malloc0(sizeof(MaltaFPGAState));
 
@@ -560,7 +567,10 @@ static MaltaFPGAState *malta_fpga_init(MemoryRegion *address_space,
     memory_region_add_subregion(address_space, base, &s->iomem_lo);
     memory_region_add_subregion(address_space, base + 0xa00, &s->iomem_hi);
 
-    s->display = qemu_chr_new("fpga", "vc:320x200", malta_fpga_led_init);
+    chr = qemu_chr_new("fpga", "vc:320x200");
+    qemu_chr_fe_init(&s->display, chr, NULL);
+    qemu_chr_fe_set_handlers(&s->display, NULL, NULL,
+                             malta_fgpa_display_event, NULL, s, NULL, true);
 
     s->uart = serial_mm_init(address_space, base + 0x900, 3, uart_irq,
                              230400, uart_chr, DEVICE_NATIVE_ENDIAN);
@@ -831,8 +841,9 @@ static int64_t load_kernel (void)
     if (loaderparams.initrd_filename) {
         initrd_size = get_image_size (loaderparams.initrd_filename);
         if (initrd_size > 0) {
-            initrd_offset = (kernel_high + ~INITRD_PAGE_MASK) & INITRD_PAGE_MASK;
-            if (initrd_offset + initrd_size > ram_size) {
+            initrd_offset = (loaderparams.ram_low_size - initrd_size
+                             - ~INITRD_PAGE_MASK) & INITRD_PAGE_MASK;
+            if (kernel_high >= initrd_offset) {
                 fprintf(stderr,
                         "qemu: memory too small for initial ram disk '%s'\n",
                         loaderparams.initrd_filename);
@@ -1025,7 +1036,7 @@ void mips_malta_init(MachineState *machine)
         if (!serial_hds[i]) {
             char label[32];
             snprintf(label, sizeof(label), "serial%d", i);
-            serial_hds[i] = qemu_chr_new(label, "null", NULL);
+            serial_hds[i] = qemu_chr_new(label, "null");
         }
     }
 
@@ -1167,7 +1178,7 @@ void mips_malta_init(MachineState *machine)
      * handled by an overlapping region as the resulting ROM code subpage
      * regions are not executable.
      */
-    memory_region_init_ram(bios_copy, NULL, "bios.1fc", BIOS_SIZE,
+    memory_region_init_ram_nomigrate(bios_copy, NULL, "bios.1fc", BIOS_SIZE,
                            &error_fatal);
     if (!rom_copy(memory_region_get_ram_ptr(bios_copy),
                   FLASH_ADDRESS, BIOS_SIZE)) {
@@ -1215,7 +1226,7 @@ void mips_malta_init(MachineState *machine)
     isa_create_simple(isa_bus, "i8042");
 
     rtc_init(isa_bus, 2000, NULL);
-    serial_hds_isa_init(isa_bus, 2);
+    serial_hds_isa_init(isa_bus, 0, 2);
     parallel_hds_isa_init(isa_bus, 1);
 
     for(i = 0; i < MAX_FD; i++) {
@@ -1253,6 +1264,7 @@ static void mips_malta_machine_init(MachineClass *mc)
 {
     mc->desc = "MIPS Malta Core LV";
     mc->init = mips_malta_init;
+    mc->block_default_type = IF_IDE;
     mc->max_cpus = 16;
     mc->is_default = 1;
 }

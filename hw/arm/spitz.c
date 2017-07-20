@@ -29,6 +29,7 @@
 #include "sysemu/block-backend.h"
 #include "hw/sysbus.h"
 #include "exec/address-spaces.h"
+#include "sysemu/sysemu.h"
 
 #undef REG_FMT
 #define REG_FMT			"0x%02lx"
@@ -844,9 +845,18 @@ static void spitz_lcd_hsync_handler(void *opaque, int line, int level)
     spitz_hsync ^= 1;
 }
 
+static void spitz_reset(void *opaque, int line, int level)
+{
+    if (level) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
 static void spitz_gpio_setup(PXA2xxState *cpu, int slots)
 {
     qemu_irq lcd_hsync;
+    qemu_irq reset;
+
     /*
      * Bad hack: We toggle the LCD hsync GPIO on every GPIO status
      * read to satisfy broken guests that poll-wait for hsync.
@@ -867,7 +877,8 @@ static void spitz_gpio_setup(PXA2xxState *cpu, int slots)
     qemu_irq_raise(qdev_get_gpio_in(cpu->gpio, SPITZ_GPIO_BAT_COVER));
 
     /* Handle reset */
-    qdev_connect_gpio_out(cpu->gpio, SPITZ_GPIO_ON_RESET, cpu->reset);
+    reset = qemu_allocate_irq(spitz_reset, cpu, 0);
+    qdev_connect_gpio_out(cpu->gpio, SPITZ_GPIO_ON_RESET, reset);
 
     /* PCMCIA signals: card's IRQ and Card-Detect */
     if (slots >= 1)
@@ -909,7 +920,6 @@ static void spitz_common_init(MachineState *machine,
     sl_flash_register(mpu, (model == spitz) ? FLASH_128M : FLASH_1024M);
 
     memory_region_init_ram(rom, NULL, "spitz.rom", SPITZ_ROM, &error_fatal);
-    vmstate_register_ram_global(rom);
     memory_region_set_readonly(rom, true);
     memory_region_add_subregion(address_space_mem, 0, rom);
 
@@ -987,6 +997,7 @@ static void spitzpda_class_init(ObjectClass *oc, void *data)
 
     mc->desc = "Sharp SL-C3000 (Spitz) PDA (PXA270)";
     mc->init = spitz_init;
+    mc->block_default_type = IF_IDE;
 }
 
 static const TypeInfo spitzpda_type = {
@@ -1001,6 +1012,7 @@ static void borzoipda_class_init(ObjectClass *oc, void *data)
 
     mc->desc = "Sharp SL-C3100 (Borzoi) PDA (PXA270)";
     mc->init = borzoi_init;
+    mc->block_default_type = IF_IDE;
 }
 
 static const TypeInfo borzoipda_type = {
@@ -1015,6 +1027,7 @@ static void terrierpda_class_init(ObjectClass *oc, void *data)
 
     mc->desc = "Sharp SL-C3200 (Terrier) PDA (PXA270)";
     mc->init = terrier_init;
+    mc->block_default_type = IF_IDE;
 }
 
 static const TypeInfo terrierpda_type = {
@@ -1062,7 +1075,7 @@ static void sl_nand_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_sl_nand_info;
     dc->props = sl_nand_properties;
     /* Reason: init() method uses drive_get() */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
 }
 
 static const TypeInfo sl_nand_info = {

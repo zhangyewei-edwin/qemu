@@ -32,7 +32,6 @@
 #include "hw/mips/mips.h"
 #include "hw/mips/cpudevs.h"
 #include "hw/pci/pci.h"
-#include "sysemu/char.h"
 #include "sysemu/sysemu.h"
 #include "audio/audio.h"
 #include "qemu/log.h"
@@ -297,7 +296,6 @@ static void mips_fulong2e_init(MachineState *machine)
     memory_region_allocate_system_memory(ram, NULL, "fulong2e.ram", ram_size);
     memory_region_init_ram(bios, NULL, "fulong2e.bios", bios_size,
                            &error_fatal);
-    vmstate_register_ram_global(bios);
     memory_region_set_readonly(bios, true);
 
     memory_region_add_subregion(address_space_mem, 0, ram);
@@ -374,7 +372,7 @@ static void mips_fulong2e_init(MachineState *machine)
 
     rtc_init(isa_bus, 2000, NULL);
 
-    serial_hds_isa_init(isa_bus, MAX_SERIAL_PORTS);
+    serial_hds_isa_init(isa_bus, 0, MAX_SERIAL_PORTS);
     parallel_hds_isa_init(isa_bus, 1);
 
     /* Sound card */
@@ -387,6 +385,7 @@ static void mips_fulong2e_machine_init(MachineClass *mc)
 {
     mc->desc = "Fulong 2e mini pc";
     mc->init = mips_fulong2e_init;
+    mc->block_default_type = IF_IDE;
 }
 
 DEFINE_MACHINE("fulong2e", mips_fulong2e_machine_init)

@@ -39,6 +39,10 @@ qemu_io_args = [os.environ.get('QEMU_IO_PROG', 'qemu-io')]
 if os.environ.get('QEMU_IO_OPTIONS'):
     qemu_io_args += os.environ['QEMU_IO_OPTIONS'].strip().split(' ')
 
+qemu_nbd_args = [os.environ.get('QEMU_NBD_PROG', 'qemu-nbd')]
+if os.environ.get('QEMU_NBD_OPTIONS'):
+    qemu_nbd_args += os.environ['QEMU_NBD_OPTIONS'].strip().split(' ')
+
 qemu_prog = os.environ.get('QEMU_PROG', 'qemu')
 qemu_opts = os.environ.get('QEMU_OPTIONS', '').strip().split(' ')
 
@@ -87,6 +91,10 @@ def qemu_io(*args):
         sys.stderr.write('qemu-io received signal %i: %s\n' % (-exitcode, ' '.join(args)))
     return subp.communicate()[0]
 
+def qemu_nbd(*args):
+    '''Run qemu-nbd in daemon mode and return the parent's exit code'''
+    return subprocess.call(qemu_nbd_args + ['--fork'] + list(args))
+
 def compare_images(img1, img2, fmt1=imgfmt, fmt2=imgfmt):
     '''Return True if two image files are identical'''
     return qemu_img('compare', '-f', fmt1,
@@ -132,12 +140,19 @@ def log(msg, filters=[]):
 class VM(qtest.QEMUQtestMachine):
     '''A QEMU VM'''
 
-    def __init__(self):
-        super(VM, self).__init__(qemu_prog, qemu_opts, test_dir=test_dir,
+    def __init__(self, path_suffix=''):
+        name = "qemu%s-%d" % (path_suffix, os.getpid())
+        super(VM, self).__init__(qemu_prog, qemu_opts, name=name,
+                                 test_dir=test_dir,
                                  socket_scm_helper=socket_scm_helper)
         if debug:
             self._debug = True
         self._num_drives = 0
+
+    def add_device(self, opts):
+        self._args.append('-device')
+        self._args.append(opts)
+        return self
 
     def add_drive_raw(self, opts):
         self._args.append('-drive')
@@ -160,6 +175,14 @@ class VM(qtest.QEMUQtestMachine):
         self._args.append('-drive')
         self._args.append(','.join(options))
         self._num_drives += 1
+        return self
+
+    def add_blockdev(self, opts):
+        self._args.append('-blockdev')
+        if isinstance(opts, str):
+            self._args.append(opts)
+        else:
+            self._args.append(','.join(opts))
         return self
 
     def pause_drive(self, drive, event=None):
@@ -207,6 +230,26 @@ class QMPTestCase(unittest.TestCase):
                     self.fail('invalid index "%s" in path "%s" in "%s"' % (idx, path, str(d)))
         return d
 
+    def flatten_qmp_object(self, obj, output=None, basestr=''):
+        if output is None:
+            output = dict()
+        if isinstance(obj, list):
+            for i in range(len(obj)):
+                self.flatten_qmp_object(obj[i], output, basestr + str(i) + '.')
+        elif isinstance(obj, dict):
+            for key in obj:
+                self.flatten_qmp_object(obj[key], output, basestr + key + '.')
+        else:
+            output[basestr[:-1]] = obj # Strip trailing '.'
+        return output
+
+    def qmp_to_opts(self, obj):
+        obj = self.flatten_qmp_object(obj)
+        output_list = list()
+        for key in obj:
+            output_list += [key + '=' + obj[key]]
+        return ','.join(output_list)
+
     def assert_qmp_absent(self, d, path):
         try:
             result = self.dictpath(d, path)
@@ -236,6 +279,13 @@ class QMPTestCase(unittest.TestCase):
                 return
         self.assertTrue(False, "Cannot find %s %s in result:\n%s" % \
                 (node_name, file_name, result))
+
+    def assert_json_filename_equal(self, json_filename, reference):
+        '''Asserts that the given filename is a json: filename and that its
+           content is equal to the given reference object'''
+        self.assertEqual(json_filename[:5], 'json:')
+        self.assertEqual(self.flatten_qmp_object(json.loads(json_filename[5:])),
+                         self.flatten_qmp_object(reference))
 
     def cancel_and_wait(self, drive='drive0', force=False, resume=False):
         '''Cancel a block job and wait for it to finish, returning the event'''
@@ -313,9 +363,12 @@ def verify_platform(supported_oses=['linux']):
     if True not in [sys.platform.startswith(x) for x in supported_oses]:
         notrun('not suitable for this OS: %s' % sys.platform)
 
+def supports_quorum():
+    return 'quorum' in qemu_img_pipe('--help')
+
 def verify_quorum():
     '''Skip test suite if quorum support is not available'''
-    if 'quorum' not in qemu_img_pipe('--help'):
+    if not supports_quorum():
         notrun('quorum support missing')
 
 def main(supported_fmts=[], supported_oses=['linux']):

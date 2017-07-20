@@ -53,9 +53,9 @@ static void mips_qemu_write (void *opaque, hwaddr addr,
                              uint64_t val, unsigned size)
 {
     if ((addr & 0xffff) == 0 && val == 42)
-        qemu_system_reset_request ();
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     else if ((addr & 0xffff) == 4 && val == 42)
-        qemu_system_shutdown_request ();
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
 }
 
 static uint64_t mips_qemu_read (void *opaque, hwaddr addr,
@@ -238,7 +238,6 @@ void mips_r4k_init(MachineState *machine)
         bios = g_new(MemoryRegion, 1);
         memory_region_init_ram(bios, NULL, "mips_r4k.bios", BIOS_SIZE,
                                &error_fatal);
-        vmstate_register_ram_global(bios);
         memory_region_set_readonly(bios, true);
         memory_region_add_subregion(get_system_memory(), 0x1fc00000, bios);
 
@@ -286,7 +285,7 @@ void mips_r4k_init(MachineState *machine)
 
     pit = pit_init(isa_bus, 0x40, 0, NULL);
 
-    serial_hds_isa_init(isa_bus, MAX_SERIAL_PORTS);
+    serial_hds_isa_init(isa_bus, 0, MAX_SERIAL_PORTS);
 
     isa_vga_init(isa_bus);
 
@@ -306,6 +305,7 @@ static void mips_machine_init(MachineClass *mc)
 {
     mc->desc = "mips r4k platform";
     mc->init = mips_r4k_init;
+    mc->block_default_type = IF_IDE;
 }
 
 DEFINE_MACHINE("mips", mips_machine_init)

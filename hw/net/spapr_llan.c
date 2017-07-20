@@ -34,19 +34,12 @@
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
 #include "sysemu/sysemu.h"
+#include "trace.h"
 
 #include <libfdt.h>
 
 #define ETH_ALEN        6
 #define MAX_PACKET_SIZE 65536
-
-/*#define DEBUG*/
-
-#ifdef DEBUG
-#define DPRINTF(fmt...) do { fprintf(stderr, fmt); } while (0)
-#else
-#define DPRINTF(fmt...)
-#endif
 
 /* Compatibility flags for migration */
 #define SPAPRVLAN_FLAG_RX_BUF_POOLS_BIT  0
@@ -112,7 +105,7 @@ typedef struct VIOsPAPRVLANDevice {
     uint32_t add_buf_ptr, use_buf_ptr, rx_bufs;
     hwaddr rxq_ptr;
     QEMUTimer *rxp_timer;
-    uint32_t compat_flags;             /* Compatability flags for migration */
+    uint32_t compat_flags;             /* Compatibility flags for migration */
     RxBufPool *rx_pool[RX_MAX_POOLS];  /* Receive buffer descriptor pools */
 } VIOsPAPRVLANDevice;
 
@@ -158,8 +151,10 @@ static vlan_bd_t spapr_vlan_get_rx_bd_from_pool(VIOsPAPRVLANDevice *dev,
         return 0;
     }
 
-    DPRINTF("Found buffer: pool=%d count=%d rxbufs=%d\n", pool,
-            dev->rx_pool[pool]->count, dev->rx_bufs);
+
+    trace_spapr_vlan_get_rx_bd_from_pool_found(pool,
+                                               dev->rx_pool[pool]->count,
+                                               dev->rx_bufs);
 
     /* Remove the buffer from the pool */
     dev->rx_pool[pool]->count--;
@@ -186,8 +181,8 @@ static vlan_bd_t spapr_vlan_get_rx_bd_from_page(VIOsPAPRVLANDevice *dev,
         }
 
         bd = vio_ldq(&dev->sdev, dev->buf_list + buf_ptr);
-        DPRINTF("use_buf_ptr=%d bd=0x%016llx\n",
-                buf_ptr, (unsigned long long)bd);
+
+        trace_spapr_vlan_get_rx_bd_from_page(buf_ptr, (uint64_t)bd);
     } while ((!(bd & VLAN_BD_VALID) || VLAN_BD_LEN(bd) < size + 8)
              && buf_ptr != dev->use_buf_ptr);
 
@@ -200,7 +195,7 @@ static vlan_bd_t spapr_vlan_get_rx_bd_from_page(VIOsPAPRVLANDevice *dev,
     dev->use_buf_ptr = buf_ptr;
     vio_stq(&dev->sdev, dev->buf_list + dev->use_buf_ptr, 0);
 
-    DPRINTF("Found buffer: ptr=%d rxbufs=%d\n", dev->use_buf_ptr, dev->rx_bufs);
+    trace_spapr_vlan_get_rx_bd_from_page_found(dev->use_buf_ptr, dev->rx_bufs);
 
     return bd;
 }
@@ -215,8 +210,7 @@ static ssize_t spapr_vlan_receive(NetClientState *nc, const uint8_t *buf,
     uint64_t handle;
     uint8_t control;
 
-    DPRINTF("spapr_vlan_receive() [%s] rx_bufs=%d\n", sdev->qdev.id,
-            dev->rx_bufs);
+    trace_spapr_vlan_receive(sdev->qdev.id, dev->rx_bufs);
 
     if (!dev->isopen) {
         return -1;
@@ -244,7 +238,7 @@ static ssize_t spapr_vlan_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
-    DPRINTF("spapr_vlan_receive: DMA write completed\n");
+    trace_spapr_vlan_receive_dma_completed();
 
     /* Update the receive queue */
     control = VLAN_RXQC_TOGGLE | VLAN_RXQC_VALID;
@@ -258,12 +252,11 @@ static ssize_t spapr_vlan_receive(NetClientState *nc, const uint8_t *buf,
     vio_sth(sdev, VLAN_BD_ADDR(rxq_bd) + dev->rxq_ptr + 2, 8);
     vio_stb(sdev, VLAN_BD_ADDR(rxq_bd) + dev->rxq_ptr, control);
 
-    DPRINTF("wrote rxq entry (ptr=0x%llx): 0x%016llx 0x%016llx\n",
-            (unsigned long long)dev->rxq_ptr,
-            (unsigned long long)vio_ldq(sdev, VLAN_BD_ADDR(rxq_bd) +
-                                        dev->rxq_ptr),
-            (unsigned long long)vio_ldq(sdev, VLAN_BD_ADDR(rxq_bd) +
-                                        dev->rxq_ptr + 8));
+    trace_spapr_vlan_receive_wrote(dev->rxq_ptr,
+                                   vio_ldq(sdev, VLAN_BD_ADDR(rxq_bd) +
+                                                 dev->rxq_ptr),
+                                   vio_ldq(sdev, VLAN_BD_ADDR(rxq_bd) +
+                                                 dev->rxq_ptr + 8));
 
     dev->rxq_ptr += 16;
     if (dev->rxq_ptr >= VLAN_BD_LEN(rxq_bd)) {
@@ -392,18 +385,24 @@ static int spapr_vlan_devnode(VIOsPAPRDevice *dev, void *fdt, int node_off)
     int ret;
 
     /* Some old phyp versions give the mac address in an 8-byte
-     * property.  The kernel driver has an insane workaround for this;
+     * property.  The kernel driver (before 3.10) has an insane workaround;
      * rather than doing the obvious thing and checking the property
      * length, it checks whether the first byte has 0b10 in the low
      * bits.  If a correct 6-byte property has a different first byte
      * the kernel will get the wrong mac address, overrunning its
      * buffer in the process (read only, thank goodness).
      *
-     * Here we workaround the kernel workaround by always supplying an
-     * 8-byte property, with the mac address in the last six bytes */
-    memcpy(&padded_mac[2], &vdev->nicconf.macaddr, ETH_ALEN);
-    ret = fdt_setprop(fdt, node_off, "local-mac-address",
-                      padded_mac, sizeof(padded_mac));
+     * Here we return a 6-byte address unless that would break a pre-3.10
+     * driver.  In that case we return a padded 8-byte address to allow the old
+     * workaround to succeed. */
+    if ((vdev->nicconf.macaddr.a[0] & 0x3) == 0x2) {
+        ret = fdt_setprop(fdt, node_off, "local-mac-address",
+                          &vdev->nicconf.macaddr, ETH_ALEN);
+    } else {
+        memcpy(&padded_mac[2], &vdev->nicconf.macaddr, ETH_ALEN);
+        ret = fdt_setprop(fdt, node_off, "local-mac-address",
+                          padded_mac, sizeof(padded_mac));
+    }
     if (ret < 0) {
         return ret;
     }
@@ -566,7 +565,7 @@ static target_long spapr_vlan_add_rxbuf_to_pool(VIOsPAPRVLANDevice *dev,
     if (pool < 0) {
         /*
          * No matching pool found? Try to use a new one. If the guest used all
-         * pools before, but changed the size of one pool inbetween, we might
+         * pools before, but changed the size of one pool in the meantime, we might
          * need to recycle that pool here (if it's empty already). Thus scan
          * all buffer pools now, starting with the last (likely empty) one.
          */
@@ -580,8 +579,8 @@ static target_long spapr_vlan_add_rxbuf_to_pool(VIOsPAPRVLANDevice *dev,
                 qsort(dev->rx_pool, RX_MAX_POOLS, sizeof(dev->rx_pool[0]),
                       rx_pool_size_compare);
                 pool = spapr_vlan_get_rx_pool_id(dev, size);
-                DPRINTF("created RX pool %d for size %lld\n", pool,
-                        VLAN_BD_LEN(buf));
+                trace_spapr_vlan_add_rxbuf_to_pool_create(pool,
+                                                          VLAN_BD_LEN(buf));
                 break;
             }
         }
@@ -591,8 +590,8 @@ static target_long spapr_vlan_add_rxbuf_to_pool(VIOsPAPRVLANDevice *dev,
         return H_RESOURCE;
     }
 
-    DPRINTF("h_add_llan_buf():  Add buf using pool %i (size %lli, count=%i)\n",
-            pool, VLAN_BD_LEN(buf), dev->rx_pool[pool]->count);
+    trace_spapr_vlan_add_rxbuf_to_pool(pool, VLAN_BD_LEN(buf),
+                                       dev->rx_pool[pool]->count);
 
     dev->rx_pool[pool]->bds[dev->rx_pool[pool]->count++] = buf;
 
@@ -623,8 +622,7 @@ static target_long spapr_vlan_add_rxbuf_to_page(VIOsPAPRVLANDevice *dev,
 
     vio_stq(&dev->sdev, dev->buf_list + dev->add_buf_ptr, buf);
 
-    DPRINTF("h_add_llan_buf():  Added buf  ptr=%d  rx_bufs=%d bd=0x%016llx\n",
-            dev->add_buf_ptr, dev->rx_bufs, (unsigned long long)buf);
+    trace_spapr_vlan_add_rxbuf_to_page(dev->add_buf_ptr, dev->rx_bufs, buf);
 
     return 0;
 }
@@ -640,8 +638,7 @@ static target_ulong h_add_logical_lan_buffer(PowerPCCPU *cpu,
     VIOsPAPRVLANDevice *dev = VIO_SPAPR_VLAN_DEVICE(sdev);
     target_long ret;
 
-    DPRINTF("H_ADD_LOGICAL_LAN_BUFFER(0x" TARGET_FMT_lx
-            ", 0x" TARGET_FMT_lx ")\n", reg, buf);
+    trace_spapr_vlan_h_add_logical_lan_buffer(reg, buf);
 
     if (!sdev) {
         hcall_dprintf("Bad device\n");
@@ -694,14 +691,13 @@ static target_ulong h_send_logical_lan(PowerPCCPU *cpu,
     int i, nbufs;
     int ret;
 
-    DPRINTF("H_SEND_LOGICAL_LAN(0x" TARGET_FMT_lx ", <bufs>, 0x"
-            TARGET_FMT_lx ")\n", reg, continue_token);
+    trace_spapr_vlan_h_send_logical_lan(reg, continue_token);
 
     if (!sdev) {
         return H_PARAMETER;
     }
 
-    DPRINTF("rxbufs = %d\n", dev->rx_bufs);
+    trace_spapr_vlan_h_send_logical_lan_rxbufs(dev->rx_bufs);
 
     if (!dev->isopen) {
         return H_DROPPED;
@@ -713,7 +709,7 @@ static target_ulong h_send_logical_lan(PowerPCCPU *cpu,
 
     total_len = 0;
     for (i = 0; i < 6; i++) {
-        DPRINTF("   buf desc: 0x" TARGET_FMT_lx "\n", bufs[i]);
+        trace_spapr_vlan_h_send_logical_lan_buf_desc(bufs[i]);
         if (!(bufs[i] & VLAN_BD_VALID)) {
             break;
         }
@@ -721,8 +717,7 @@ static target_ulong h_send_logical_lan(PowerPCCPU *cpu,
     }
 
     nbufs = i;
-    DPRINTF("h_send_logical_lan() %d buffers, total length 0x%x\n",
-            nbufs, total_len);
+    trace_spapr_vlan_h_send_logical_lan_total(nbufs, total_len);
 
     if (total_len == 0) {
         return H_SUCCESS;

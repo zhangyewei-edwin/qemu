@@ -19,13 +19,12 @@ from tracetool import out
 PUBLIC = True
 
 
-def generate_h_begin(events):
+def generate_h_begin(events, group):
     out('#include <syslog.h>',
-        '#include "trace/control.h"',
         '')
 
 
-def generate_h(event):
+def generate_h(event, group):
     argnames = ", ".join(event.args.names())
     if len(event.args) > 0:
         argnames = ", " + argnames
@@ -36,9 +35,9 @@ def generate_h(event):
     else:
         cond = "trace_event_get_state(%s)" % ("TRACE_" + event.name.upper())
 
-    out('        if (%(cond)s) {',
-        '            syslog(LOG_INFO, "%(name)s " %(fmt)s %(argnames)s);',
-        '        }',
+    out('    if (%(cond)s) {',
+        '        syslog(LOG_INFO, "%(name)s " %(fmt)s %(argnames)s);',
+        '    }',
         cond=cond,
         name=event.name,
         fmt=event.fmt.rstrip("\n"),

@@ -16,9 +16,9 @@
 #include "qemu/option.h"
 #include "qemu/range.h"
 #include "qemu/sockets.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "sysemu/sysemu.h"
-#include "hw/nvram/openbios_firmware_abi.h"
+#include "hw/nvram/chrp_nvram.h"
 
 #define MIN_NVRAM_SIZE 8192 /* from spapr_nvram.c */
 
@@ -41,7 +41,7 @@ static bool ufd_version_check(void)
     struct uffdio_api api_struct;
     uint64_t ioctl_mask;
 
-    int ufd = ufd = syscall(__NR_userfaultfd, O_CLOEXEC);
+    int ufd = syscall(__NR_userfaultfd, O_CLOEXEC);
 
     if (ufd == -1) {
         g_test_message("Skipping test: userfaultfd not available");
@@ -137,15 +137,15 @@ static void init_bootfile_ppc(const char *bootpath)
 {
     FILE *bootfile;
     char buf[MIN_NVRAM_SIZE];
-    struct OpenBIOS_nvpart_v1 *header = (struct OpenBIOS_nvpart_v1 *)buf;
+    ChrpNvramPartHdr *header = (ChrpNvramPartHdr *)buf;
 
     memset(buf, 0, MIN_NVRAM_SIZE);
 
     /* Create a "common" partition in nvram to store boot-command property */
 
-    header->signature = OPENBIOS_PART_SYSTEM;
+    header->signature = CHRP_NVPART_SYSTEM;
     memcpy(header->name, "common", 6);
-    OpenBIOS_finish_partition(header, MIN_NVRAM_SIZE);
+    chrp_nvram_finish_partition(header, MIN_NVRAM_SIZE);
 
     /* FW_MAX_SIZE is 4MB, but slof.bin is only 900KB,
      * so let's modify memory between 1MB and 100MB
@@ -380,17 +380,21 @@ static void test_migrate(void)
                                   " -incoming %s",
                                   tmpfs, bootpath, uri);
     } else if (strcmp(arch, "ppc64") == 0) {
+        const char *accel;
+
+        /* On ppc64, the test only works with kvm-hv, but not with kvm-pr */
+        accel = access("/sys/module/kvm_hv", F_OK) ? "tcg" : "kvm:tcg";
         init_bootfile_ppc(bootpath);
-        cmd_src = g_strdup_printf("-machine accel=kvm:tcg -m 256M"
+        cmd_src = g_strdup_printf("-machine accel=%s -m 256M"
                                   " -name pcsource,debug-threads=on"
                                   " -serial file:%s/src_serial"
                                   " -drive file=%s,if=pflash,format=raw",
-                                  tmpfs, bootpath);
-        cmd_dst = g_strdup_printf("-machine accel=kvm:tcg -m 256M"
+                                  accel, tmpfs, bootpath);
+        cmd_dst = g_strdup_printf("-machine accel=%s -m 256M"
                                   " -name pcdest,debug-threads=on"
                                   " -serial file:%s/dest_serial"
                                   " -incoming %s",
-                                  tmpfs, uri);
+                                  accel, tmpfs, uri);
     } else {
         g_assert_not_reached();
     }
@@ -478,7 +482,7 @@ static void test_migrate(void)
         usleep(10 * 1000);
     } while (dest_byte_a == dest_byte_b);
 
-    qmp("{ 'execute' : 'stop'}");
+    qmp_discard_response("{ 'execute' : 'stop'}");
     /* With it stopped, check nothing changes */
     qtest_memread(to, start_address, &dest_byte_c, 1);
     sleep(1);

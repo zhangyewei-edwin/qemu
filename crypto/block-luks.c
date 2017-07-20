@@ -29,10 +29,7 @@
 #include "crypto/pbkdf.h"
 #include "crypto/secret.h"
 #include "crypto/random.h"
-
-#ifdef CONFIG_UUID
-#include <uuid/uuid.h>
-#endif
+#include "qemu/uuid.h"
 
 #include "qemu/coroutine.h"
 
@@ -478,8 +475,8 @@ qcrypto_block_luks_load_key(QCryptoBlock *block,
     rv = readfunc(block,
                   slot->key_offset * QCRYPTO_BLOCK_LUKS_SECTOR_SIZE,
                   splitkey, splitkeylen,
-                  errp,
-                  opaque);
+                  opaque,
+                  errp);
     if (rv < 0) {
         goto cleanup;
     }
@@ -641,6 +638,7 @@ qcrypto_block_luks_find_key(QCryptoBlock *block,
 static int
 qcrypto_block_luks_open(QCryptoBlock *block,
                         QCryptoBlockOpenOptions *options,
+                        const char *optprefix,
                         QCryptoBlockReadFunc readfunc,
                         void *opaque,
                         unsigned int flags,
@@ -664,7 +662,8 @@ qcrypto_block_luks_open(QCryptoBlock *block,
 
     if (!(flags & QCRYPTO_BLOCK_OPEN_NO_IO)) {
         if (!options->u.luks.key_secret) {
-            error_setg(errp, "Parameter 'key-secret' is required for cipher");
+            error_setg(errp, "Parameter '%skey-secret' is required for cipher",
+                       optprefix ? optprefix : "");
             return -1;
         }
         password = qcrypto_secret_lookup_as_utf8(
@@ -682,8 +681,8 @@ qcrypto_block_luks_open(QCryptoBlock *block,
     rv = readfunc(block, 0,
                   (uint8_t *)&luks->header,
                   sizeof(luks->header),
-                  errp,
-                  opaque);
+                  opaque,
+                  errp);
     if (rv < 0) {
         ret = rv;
         goto fail;
@@ -877,23 +876,18 @@ qcrypto_block_luks_open(QCryptoBlock *block,
 }
 
 
-static int
-qcrypto_block_luks_uuid_gen(uint8_t *uuidstr, Error **errp)
+static void
+qcrypto_block_luks_uuid_gen(uint8_t *uuidstr)
 {
-#ifdef CONFIG_UUID
-    uuid_t uuid;
-    uuid_generate(uuid);
-    uuid_unparse(uuid, (char *)uuidstr);
-    return 0;
-#else
-    error_setg(errp, "Unable to generate uuids on this platform");
-    return -1;
-#endif
+    QemuUUID uuid;
+    qemu_uuid_generate(&uuid);
+    qemu_uuid_unparse(&uuid, (char *)uuidstr);
 }
 
 static int
 qcrypto_block_luks_create(QCryptoBlock *block,
                           QCryptoBlockCreateOptions *options,
+                          const char *optprefix,
                           QCryptoBlockInitFunc initfunc,
                           QCryptoBlockWriteFunc writefunc,
                           void *opaque,
@@ -946,7 +940,8 @@ qcrypto_block_luks_create(QCryptoBlock *block,
      * be silently ignored, for compatibility with dm-crypt */
 
     if (!options->u.luks.key_secret) {
-        error_setg(errp, "Parameter 'key-secret' is required for cipher");
+        error_setg(errp, "Parameter '%skey-secret' is required for cipher",
+                   optprefix ? optprefix : "");
         return -1;
     }
     password = qcrypto_secret_lookup_as_utf8(luks_opts.key_secret, errp);
@@ -965,10 +960,7 @@ qcrypto_block_luks_create(QCryptoBlock *block,
      * it out to disk
      */
     luks->header.version = QCRYPTO_BLOCK_LUKS_VERSION;
-    if (qcrypto_block_luks_uuid_gen(luks->header.uuid,
-                                    errp) < 0) {
-        goto error;
-    }
+    qcrypto_block_luks_uuid_gen(luks->header.uuid);
 
     cipher_alg = qcrypto_block_luks_cipher_alg_lookup(luks_opts.cipher_alg,
                                                       errp);
@@ -1258,7 +1250,7 @@ qcrypto_block_luks_create(QCryptoBlock *block,
         QCRYPTO_BLOCK_LUKS_SECTOR_SIZE;
 
     /* Reserve header space to match payload offset */
-    initfunc(block, block->payload_offset, &local_err, opaque);
+    initfunc(block, block->payload_offset, opaque, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
         goto error;
@@ -1283,8 +1275,8 @@ qcrypto_block_luks_create(QCryptoBlock *block,
     writefunc(block, 0,
               (const uint8_t *)&luks->header,
               sizeof(luks->header),
-              &local_err,
-              opaque);
+              opaque,
+              &local_err);
 
     /* Delay checking local_err until we've byte-swapped */
 
@@ -1313,8 +1305,8 @@ qcrypto_block_luks_create(QCryptoBlock *block,
                   luks->header.key_slots[0].key_offset *
                   QCRYPTO_BLOCK_LUKS_SECTOR_SIZE,
                   splitkey, splitkeylen,
-                  errp,
-                  opaque) != splitkeylen) {
+                  opaque,
+                  errp) != splitkeylen) {
         goto error;
     }
 

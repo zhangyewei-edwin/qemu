@@ -119,7 +119,10 @@ struct SimpleSpiceDisplay {
     /* opengl rendering */
     QEMUBH *gl_unblock_bh;
     QEMUTimer *gl_unblock_timer;
-    int dmabuf_fd;
+    ConsoleGLState *gls;
+    int gl_updates;
+    bool have_scanout;
+    bool have_surface;
 #endif
 };
 
@@ -136,6 +139,8 @@ struct SimpleSpiceCursor {
     QXLCommandExt ext;
     QXLCursor cursor;
 };
+
+extern bool spice_opengl;
 
 int qemu_spice_rect_is_empty(const QXLRect* r);
 void qemu_spice_rect_union(QXLRect *dest, const QXLRect *r);
